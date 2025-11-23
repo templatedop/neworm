@@ -9,14 +9,16 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/templatedop/neworm/internal/config"
 	"github.com/templatedop/neworm/internal/introspect"
 )
 
 // Generator generates Go code from database schema
 type Generator struct {
-	schema     *introspect.Schema
-	outputDir  string
+	schema      *introspect.Schema
+	outputDir   string
 	packageName string
+	config      *config.Config
 }
 
 // New creates a new Generator
@@ -25,6 +27,16 @@ func New(schema *introspect.Schema, outputDir, packageName string) *Generator {
 		schema:      schema,
 		outputDir:   outputDir,
 		packageName: packageName,
+	}
+}
+
+// NewWithConfig creates a new Generator with configuration
+func NewWithConfig(schema *introspect.Schema, cfg *config.Config) *Generator {
+	return &Generator{
+		schema:      schema,
+		outputDir:   cfg.Generation.OutputDir,
+		packageName: cfg.Generation.PackageName,
+		config:      cfg,
 	}
 }
 
@@ -52,6 +64,13 @@ func (g *Generator) Generate() error {
 	// Generate predicates
 	if err := g.generatePredicates(); err != nil {
 		return fmt.Errorf("failed to generate predicates: %w", err)
+	}
+
+	// Generate custom queries from config
+	if g.config != nil && len(g.config.Queries) > 0 {
+		if err := g.generateCustomQueries(); err != nil {
+			return fmt.Errorf("failed to generate custom queries: %w", err)
+		}
 	}
 
 	return nil
@@ -324,8 +343,11 @@ package {{ .Package }}
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/templatedop/neworm/runtime"
 )
 
 // Client is the database client
@@ -348,6 +370,54 @@ func (c *Client) Close() {
 	c.db.Close()
 }
 
+// NewBatch creates a new batch operation
+func (c *Client) NewBatch() *Batch {
+	return &Batch{
+		client: c,
+		batch:  runtime.NewBatch(c.db),
+		{{ range .Tables }}{{ toLower (slice (toModelName .Name) 0 1) }}{{ slice (toModelName .Name) 1 (len (toModelName .Name)) }}: &{{ toModelName .Name }}Batch{},
+		{{ end }}
+	}
+}
+
+// Batch represents a batch of operations
+type Batch struct {
+	client *Client
+	batch  *runtime.Batch
+	{{ range .Tables }}{{ toModelName .Name }} *{{ toModelName .Name }}Batch
+	{{ end }}
+}
+
+// Send executes the batch
+func (b *Batch) Send(ctx context.Context) error {
+	// Queue all operations
+	{{ range .Tables }}
+	for _, m := range b.{{ toModelName .Name }}.creates {
+		b.batch.Queue(` + "`" + `INSERT INTO {{ .Name }} ({{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}{{ $col.Name }}{{ end }}) VALUES ({{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}${{ add $i 1 }}{{ end }})` + "`" + `,
+			{{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }})
+	}
+	for _, m := range b.{{ toModelName .Name }}.updates {
+		{{ if hasPK . }}
+		b.batch.Queue(` + "`" + `UPDATE {{ .Name }} SET {{ range $i, $col := .Columns }}{{ if not $col.IsPrimaryKey }}{{ if $i }}, {{ end }}{{ $col.Name }} = ${{ add $i 1 }}{{ end }}{{ end }} WHERE {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }} AND {{ end }}{{ $pk }} = ${{ add (len $.Columns) (add $i 1) }}{{ end }}` + "`" + `,
+			{{ range $i, $col := .Columns }}{{ if not $col.IsPrimaryKey }}m.{{ toFieldName $col.Name }}, {{ end }}{{ end }}{{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $pk }}{{ end }})
+		{{ end }}
+	}
+	for _, m := range b.{{ toModelName .Name }}.deletes {
+		{{ if hasPK . }}
+		b.batch.Queue(` + "`" + `DELETE FROM {{ .Name }} WHERE {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }} AND {{ end }}{{ $pk }} = ${{ add $i 1 }}{{ end }}` + "`" + `,
+			{{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $pk }}{{ end }})
+		{{ end }}
+	}
+	{{ end }}
+
+	// Execute batch
+	results, err := b.batch.Send(ctx)
+	if err != nil {
+		return err
+	}
+	return results.Close()
+}
+
 {{ range .Tables }}
 // {{ toModelName .Name }}Client is the client for {{ .Name }} table
 type {{ toModelName .Name }}Client struct {
@@ -356,20 +426,77 @@ type {{ toModelName .Name }}Client struct {
 
 // Create inserts a new {{ toModelName .Name }}
 func (c *{{ toModelName .Name }}Client) Create(ctx context.Context, m *{{ toModelName .Name }}) error {
-	// TODO: Implement create
-	return nil
+	query := ` + "`" + `INSERT INTO {{ .Name }} ({{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}{{ $col.Name }}{{ end }})
+		VALUES ({{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}${{ add $i 1 }}{{ end }})
+		{{ if hasPK . }}RETURNING {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}{{ $pk }}{{ end }}{{ end }}` + "`" + `
+
+	{{ if hasPK . }}
+	err := c.client.db.QueryRow(ctx, query, {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }}).Scan({{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}&m.{{ toFieldName $pk }}{{ end }})
+	{{ else }}
+	_, err := c.client.db.Exec(ctx, query, {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }})
+	{{ end }}
+	return err
+}
+
+// CreateMany inserts multiple {{ toModelName .Name }} records
+func (c *{{ toModelName .Name }}Client) CreateMany(ctx context.Context, models []*{{ toModelName .Name }}) error {
+	if len(models) == 0 {
+		return nil
+	}
+
+	batch := c.client.NewBatch()
+	for _, m := range models {
+		batch.{{ toModelName .Name }}.Create(m)
+	}
+	return batch.Send(ctx)
 }
 
 // Update updates a {{ toModelName .Name }}
 func (c *{{ toModelName .Name }}Client) Update(ctx context.Context, m *{{ toModelName .Name }}) error {
-	// TODO: Implement update
-	return nil
+	{{ if hasPK . }}
+	query := ` + "`" + `UPDATE {{ .Name }} SET {{ range $i, $col := .Columns }}{{ if not $col.IsPrimaryKey }}{{ if $i }}, {{ end }}{{ $col.Name }} = ${{ add $i 1 }}{{ end }}{{ end }}
+		WHERE {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }} AND {{ end }}{{ $pk }} = ${{ add (len $.Columns) (add $i 1) }}{{ end }}` + "`" + `
+
+	_, err := c.client.db.Exec(ctx, query,
+		{{ range $i, $col := .Columns }}{{ if not $col.IsPrimaryKey }}m.{{ toFieldName $col.Name }}, {{ end }}{{ end }}
+		{{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $pk }}{{ end }})
+	return err
+	{{ else }}
+	return fmt.Errorf("table {{ .Name }} has no primary key, cannot update")
+	{{ end }}
 }
 
 // Delete deletes a {{ toModelName .Name }}
 func (c *{{ toModelName .Name }}Client) Delete(ctx context.Context, m *{{ toModelName .Name }}) error {
-	// TODO: Implement delete
-	return nil
+	{{ if hasPK . }}
+	query := ` + "`" + `DELETE FROM {{ .Name }} WHERE {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }} AND {{ end }}{{ $pk }} = ${{ add $i 1 }}{{ end }}` + "`" + `
+	_, err := c.client.db.Exec(ctx, query, {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $pk }}{{ end }})
+	return err
+	{{ else }}
+	return fmt.Errorf("table {{ .Name }} has no primary key, cannot delete")
+	{{ end }}
+}
+
+// {{ toModelName .Name }}Batch provides batch operations for {{ toModelName .Name }}
+type {{ toModelName .Name }}Batch struct {
+	creates []*{{ toModelName .Name }}
+	updates []*{{ toModelName .Name }}
+	deletes []*{{ toModelName .Name }}
+}
+
+// Create adds a create operation to the batch
+func (b *{{ toModelName .Name }}Batch) Create(m *{{ toModelName .Name }}) {
+	b.creates = append(b.creates, m)
+}
+
+// Update adds an update operation to the batch
+func (b *{{ toModelName .Name }}Batch) Update(m *{{ toModelName .Name }}) {
+	b.updates = append(b.updates, m)
+}
+
+// Delete adds a delete operation to the batch
+func (b *{{ toModelName .Name }}Batch) Delete(m *{{ toModelName .Name }}) {
+	b.deletes = append(b.deletes, m)
 }
 {{ end }}
 `
@@ -555,6 +682,67 @@ func (g *Generator) buildRelationships(table *introspect.Table) []Relationship {
 	return relationships
 }
 
+func (g *Generator) generateCustomQueries() error {
+	if len(g.config.Queries) == 0 {
+		return nil
+	}
+
+	data := map[string]interface{}{
+		"Package": g.packageName,
+		"Queries": g.config.Queries,
+	}
+
+	tmpl := `// Code generated by neworm. DO NOT EDIT.
+package {{ .Package }}
+
+import (
+	"context"
+	"fmt"
+)
+
+{{ range .Queries }}
+// {{ .Name }} - {{ .Description }}
+func (c *Client) {{ .Name }}(ctx context.Context{{ range .Params }}, {{ .Name }} {{ goType .Type }}{{ end }}) ({{ if eq .Returns "one" }}*{{ .Model }}{{ else if eq .Returns "many" }}[]*{{ .Model }}{{ else }}error{{ end }}, error) {
+	query := ` + "`" + `{{ .SQL }}` + "`" + `
+
+	{{ if eq .Returns "exec" }}
+	_, err := c.db.Exec(ctx, query{{ range .Params }}, {{ .Name }}{{ end }})
+	return err
+	{{ else if eq .Returns "one" }}
+	var result {{ .Model }}
+	err := c.db.QueryRow(ctx, query{{ range .Params }}, {{ .Name }}{{ end }}).Scan(
+		// TODO: Add proper column scanning based on model
+		&result,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+	{{ else if eq .Returns "many" }}
+	rows, err := c.db.Query(ctx, query{{ range .Params }}, {{ .Name }}{{ end }})
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []*{{ .Model }}
+	for rows.Next() {
+		var result {{ .Model }}
+		// TODO: Add proper column scanning based on model
+		if err := rows.Scan(&result); err != nil {
+			return nil, err
+		}
+		results = append(results, &result)
+	}
+	return results, rows.Err()
+	{{ end }}
+}
+{{ end }}
+`
+
+	return g.executeTemplate("queries", "queries.go", tmpl, data)
+}
+
 func (g *Generator) executeTemplate(name, filename, tmplStr string, data interface{}) error {
 	return g.executeTemplateToDir(g.outputDir, name, filename, tmplStr, data)
 }
@@ -566,6 +754,10 @@ func (g *Generator) executeTemplateToDir(dir, name, filename, tmplStr string, da
 		"toLower":      strings.ToLower,
 		"hasUUID":      hasUUID,
 		"slice":        slice,
+		"add":          add,
+		"hasPK":        hasPK,
+		"len":          length,
+		"goType":       goType,
 	}
 
 	tmpl, err := template.New(name).Funcs(funcMap).Parse(tmplStr)
@@ -638,4 +830,48 @@ func hasUUID(columns []*introspect.Column) bool {
 
 func slice(s string, start, end int) string {
 	return s[start:end]
+}
+
+func add(a, b int) int {
+	return a + b
+}
+
+func hasPK(table *introspect.Table) bool {
+	return table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0
+}
+
+func length(s interface{}) int {
+	switch v := s.(type) {
+	case string:
+		return len(v)
+	case []*introspect.Column:
+		return len(v)
+	case []string:
+		return len(v)
+	default:
+		return 0
+	}
+}
+
+func goType(yamlType string) string {
+	switch strings.ToLower(yamlType) {
+	case "string":
+		return "string"
+	case "int", "int32":
+		return "int32"
+	case "int64":
+		return "int64"
+	case "float32":
+		return "float32"
+	case "float64":
+		return "float64"
+	case "bool", "boolean":
+		return "bool"
+	case "time":
+		return "time.Time"
+	case "uuid":
+		return "uuid.UUID"
+	default:
+		return "interface{}"
+	}
 }

@@ -104,7 +104,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	// Generate code
 	fmt.Printf("📝 Generating code to: %s\n", cfg.Generation.OutputDir)
-	generator := codegen.New(schema, cfg.Generation.OutputDir, cfg.Generation.PackageName)
+	generator := codegen.NewWithConfig(schema, cfg)
 	if err := generator.Generate(); err != nil {
 		return fmt.Errorf("failed to generate code: %w", err)
 	}
@@ -115,6 +115,9 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  - Query builders: %d files\n", len(schema.Tables))
 	fmt.Printf("  - Predicates: %d packages\n", len(schema.Tables))
 	fmt.Printf("  - Client: client.go\n")
+	if len(cfg.Queries) > 0 {
+		fmt.Printf("  - Custom queries: %d methods in queries.go\n", len(cfg.Queries))
+	}
 
 	return nil
 }

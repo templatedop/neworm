@@ -16,11 +16,12 @@
 |---------|--------|-------|------|------|
 | Database-first | ✅ | ❌ | ❌ | ✅ |
 | Fluent query builder | ✅ | ✅ | ✅ | ❌ |
+| Full CRUD ORM | ✅ | ✅ | ✅ | ❌ |
 | Type-safe | ✅ | ✅ | ⚠️ | ✅ |
 | No reflection | ✅ | ❌ | ❌ | ✅ |
 | Auto relationships | ✅ | ⚠️ | ✅ | ❌ |
-| pgx batch support | ✅ | ❌ | ❌ | ❌ |
-| Custom queries | ✅ | ❌ | ❌ | ✅ |
+| ORM-style batches | ✅ | ❌ | ❌ | ❌ |
+| Custom queries (YAML) | ✅ | ❌ | ❌ | ✅ |
 
 ## Installation
 
@@ -126,6 +127,35 @@ func main() {
 
 ## Features
 
+### ✨ CRUD Operations (Full ORM)
+
+```go
+// Create
+user := &User{Name: "John", Email: "john@example.com"}
+err := client.User.Create(ctx, user)
+// user.ID is now populated if table has auto-increment PK
+
+// Create many (uses batch internally)
+users := []*User{
+    {Name: "Alice", Email: "alice@example.com"},
+    {Name: "Bob", Email: "bob@example.com"},
+}
+err := client.User.CreateMany(ctx, users)
+
+// Read (query)
+user, err := client.User.
+    Query().
+    Where(user.ID.Equals(1)).
+    First(ctx)
+
+// Update
+user.Name = "John Updated"
+err = client.User.Update(ctx, user)
+
+// Delete
+err = client.User.Delete(ctx, user)
+```
+
 ### 🎯 EntGo-Style Query Builder
 
 ```go
@@ -205,36 +235,46 @@ users, err := client.User.
     All(ctx)
 ```
 
-### 📦 Batch Operations
+### 📦 ORM-Style Batch Operations
+
+**No raw SQL needed!** Batch operations use the same ORM methods:
 
 ```go
-import "github.com/templatedop/neworm/runtime"
+// Create a batch
+batch := client.NewBatch()
 
-// Create batch
-batch := runtime.NewBatch(pool)
+// Add creates (ORM-style!)
+batch.User.Create(&User{Name: "Alice", Email: "alice@example.com"})
+batch.User.Create(&User{Name: "Bob", Email: "bob@example.com"})
 
-// Queue multiple operations
-for _, user := range users {
-    batch.Queue(
-        "INSERT INTO users (name, email) VALUES ($1, $2)",
-        user.Name, user.Email,
-    )
-}
+// Add updates
+batch.User.Update(&User{ID: 1, Name: "Updated Name"})
+batch.User.Update(&User{ID: 2, Email: "newemail@example.com"})
 
-// Send batch
-results, err := batch.Send(ctx)
+// Add deletes
+batch.User.Delete(&User{ID: 999})
+
+// Mix operations across different models
+batch.Post.Create(&Post{Title: "New Post", UserID: 1})
+batch.Comment.Create(&Comment{Content: "Great post!", PostID: 1})
+
+// Execute all operations in one batch
+err := batch.Send(ctx)
 if err != nil {
     log.Fatal(err)
 }
-defer results.Close()
+```
 
-// Process results
-for i := 0; i < len(users); i++ {
-    tag, err := results.Exec()
-    if err != nil {
-        log.Printf("Failed to insert user %d: %v", i, err)
-    }
+**Shorthand for bulk creates:**
+
+```go
+// CreateMany automatically uses batch operations
+users := []*User{
+    {Name: "Alice", Email: "alice@example.com"},
+    {Name: "Bob", Email: "bob@example.com"},
+    {Name: "Charlie", Email: "charlie@example.com"},
 }
+err := client.User.CreateMany(ctx, users)
 ```
 
 ### 🛠️ Custom Queries (YAML Config)
