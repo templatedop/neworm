@@ -154,12 +154,14 @@ import (
 
 // {{ .QueryName }} is the query builder for {{ .ModelName }}
 type {{ .QueryName }} struct {
-	client     *Client
-	predicates []runtime.Predicate
-	order      []string
-	limitVal   *int
-	offsetVal  *int
-	withFKs    map[string]*queryConfig
+	client      *Client
+	predicates  []runtime.Predicate
+	order       []string
+	limitVal    *int
+	offsetVal   *int
+	withFKs     map[string]*queryConfig
+	distinctVal bool
+	lockType    string // "UPDATE" or "SHARE"
 }
 
 type queryConfig struct {
@@ -195,6 +197,24 @@ func (q *{{ .QueryName }}) Limit(limit int) *{{ .QueryName }} {
 // Offset sets the OFFSET clause
 func (q *{{ .QueryName }}) Offset(offset int) *{{ .QueryName }} {
 	q.offsetVal = &offset
+	return q
+}
+
+// Distinct adds DISTINCT to the query
+func (q *{{ .QueryName }}) Distinct() *{{ .QueryName }} {
+	q.distinctVal = true
+	return q
+}
+
+// ForUpdate adds FOR UPDATE locking to the query
+func (q *{{ .QueryName }}) ForUpdate() *{{ .QueryName }} {
+	q.lockType = "UPDATE"
+	return q
+}
+
+// ForShare adds FOR SHARE locking to the query
+func (q *{{ .QueryName }}) ForShare() *{{ .QueryName }} {
+	q.lockType = "SHARE"
 	return q
 }
 
@@ -271,9 +291,105 @@ func (q *{{ .QueryName }}) Count(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+// Sum returns the sum of a numeric field
+func (q *{{ .QueryName }}) Sum(ctx context.Context, field string) (float64, error) {
+	query := q.buildAggregateQuery("SUM", field)
+	var result *float64
+	err := q.client.db.QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
+	if err != nil {
+		return 0, err
+	}
+	if result == nil {
+		return 0, nil
+	}
+	return *result, nil
+}
+
+// Avg returns the average of a numeric field
+func (q *{{ .QueryName }}) Avg(ctx context.Context, field string) (float64, error) {
+	query := q.buildAggregateQuery("AVG", field)
+	var result *float64
+	err := q.client.db.QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
+	if err != nil {
+		return 0, err
+	}
+	if result == nil {
+		return 0, nil
+	}
+	return *result, nil
+}
+
+// Min returns the minimum value of a field
+func (q *{{ .QueryName }}) Min(ctx context.Context, field string) (interface{}, error) {
+	query := q.buildAggregateQuery("MIN", field)
+	var result interface{}
+	err := q.client.db.QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
+	return result, err
+}
+
+// Max returns the maximum value of a field
+func (q *{{ .QueryName }}) Max(ctx context.Context, field string) (interface{}, error) {
+	query := q.buildAggregateQuery("MAX", field)
+	var result interface{}
+	err := q.client.db.QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
+	return result, err
+}
+
+// UpdateAll updates all records matching the query
+func (q *{{ .QueryName }}) UpdateAll(ctx context.Context, updates map[string]interface{}) (int64, error) {
+	if len(updates) == 0 {
+		return 0, fmt.Errorf("no fields to update")
+	}
+
+	var setParts []string
+	var args []interface{}
+	argNum := 1
+
+	for field, value := range updates {
+		setParts = append(setParts, fmt.Sprintf("%s = $%d", field, argNum))
+		args = append(args, value)
+		argNum++
+	}
+
+	query := fmt.Sprintf("UPDATE {{ .Table.Name }} SET %s", strings.Join(setParts, ", "))
+
+	if len(q.predicates) > 0 {
+		query += " WHERE " + q.buildWhere()
+		args = append(args, q.buildArgs()...)
+	}
+
+	result, err := q.client.db.Exec(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+// DeleteAll deletes all records matching the query
+func (q *{{ .QueryName }}) DeleteAll(ctx context.Context) (int64, error) {
+	query := "DELETE FROM {{ .Table.Name }}"
+
+	if len(q.predicates) > 0 {
+		query += " WHERE " + q.buildWhere()
+	}
+
+	result, err := q.client.db.Exec(ctx, query, q.buildArgs()...)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 func (q *{{ .QueryName }}) buildQuery() string {
 	var parts []string
-	parts = append(parts, "SELECT {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}{{ $col.Name }}{{ end }}")
+
+	// SELECT with optional DISTINCT
+	if q.distinctVal {
+		parts = append(parts, "SELECT DISTINCT {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}{{ $col.Name }}{{ end }}")
+	} else {
+		parts = append(parts, "SELECT {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}{{ $col.Name }}{{ end }}")
+	}
+
 	parts = append(parts, "FROM {{ .Table.Name }}")
 
 	if len(q.predicates) > 0 {
@@ -292,12 +408,31 @@ func (q *{{ .QueryName }}) buildQuery() string {
 		parts = append(parts, fmt.Sprintf("OFFSET %d", *q.offsetVal))
 	}
 
+	// Add FOR UPDATE or FOR SHARE
+	if q.lockType == "UPDATE" {
+		parts = append(parts, "FOR UPDATE")
+	} else if q.lockType == "SHARE" {
+		parts = append(parts, "FOR SHARE")
+	}
+
 	return strings.Join(parts, " ")
 }
 
 func (q *{{ .QueryName }}) buildCountQuery() string {
 	var parts []string
 	parts = append(parts, "SELECT COUNT(*)")
+	parts = append(parts, "FROM {{ .Table.Name }}")
+
+	if len(q.predicates) > 0 {
+		parts = append(parts, "WHERE "+q.buildWhere())
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func (q *{{ .QueryName }}) buildAggregateQuery(aggregateFunc, field string) string {
+	var parts []string
+	parts = append(parts, fmt.Sprintf("SELECT %s(%s)", aggregateFunc, field))
 	parts = append(parts, "FROM {{ .Table.Name }}")
 
 	if len(q.predicates) > 0 {
@@ -346,6 +481,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/templatedop/neworm/runtime"
 )
@@ -475,6 +611,45 @@ func (c *{{ toModelName .Name }}Client) Delete(ctx context.Context, m *{{ toMode
 	{{ else }}
 	return fmt.Errorf("table {{ .Name }} has no primary key, cannot delete")
 	{{ end }}
+}
+
+// Upsert inserts or updates a {{ toModelName .Name }} based on conflict
+func (c *{{ toModelName .Name }}Client) Upsert(ctx context.Context, m *{{ toModelName .Name }}, conflictColumns []string) error {
+	{{ if hasPK . }}
+	query := ` + "`" + `INSERT INTO {{ .Name }} ({{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}{{ $col.Name }}{{ end }})
+		VALUES ({{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}${{ add $i 1 }}{{ end }})
+		ON CONFLICT (` + "`" + ` + strings.Join(conflictColumns, ", ") + ` + "`" + `) DO UPDATE SET {{ range $i, $col := .Columns }}{{ if not $col.IsPrimaryKey }}{{ if $i }}, {{ end }}{{ $col.Name }} = EXCLUDED.{{ $col.Name }}{{ end }}{{ end }}
+		RETURNING {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}{{ $pk }}{{ end }}` + "`" + `
+
+	err := c.client.db.QueryRow(ctx, query, {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }}).Scan({{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}&m.{{ toFieldName $pk }}{{ end }})
+	return err
+	{{ else }}
+	return fmt.Errorf("table {{ .Name }} has no primary key, cannot upsert")
+	{{ end }}
+}
+
+// CopyFrom performs a bulk insert using PostgreSQL COPY (fastest method for bulk inserts)
+func (c *{{ toModelName .Name }}Client) CopyFrom(ctx context.Context, models []*{{ toModelName .Name }}) (int64, error) {
+	if len(models) == 0 {
+		return 0, nil
+	}
+
+	columns := []string{ {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}"{{ $col.Name }}"{{ end }} }
+
+	rows := make([][]interface{}, len(models))
+	for i, m := range models {
+		rows[i] = []interface{}{
+			{{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }},
+		}
+	}
+
+	count, err := c.client.db.CopyFrom(
+		ctx,
+		[]string{"{{ .Name }}"}, // table name
+		columns,
+		pgx.CopyFromRows(rows),
+	)
+	return count, err
 }
 
 // {{ toModelName .Name }}Batch provides batch operations for {{ toModelName .Name }}
