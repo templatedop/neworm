@@ -6,10 +6,11 @@ Pipeline mode enables you to execute queries **sequentially** where later querie
 
 ### Key Features:
 - **Sequential Execution** - Later queries can use results from earlier queries
-- **Implicit Transaction** - All queries succeed or all rollback (no explicit tx needed)
-- **Clean API** - Callback-based, similar to transaction API
+- **Implicit Transaction** - Uses BEGIN/COMMIT internally (completely transparent to user)
+- **Clean API** - Callback-based, simple and intuitive
 - **Type Safety** - All ORM operations available within the pipeline
-- **Automatic Rollback** - Error in any step rolls back all previous operations
+- **Automatic Rollback** - Error in any step automatically rolls back all operations
+- **Single Connection** - All operations use the same connection from pool
 
 ### Perfect For:
 - Creating records and using their IDs in subsequent operations
@@ -361,9 +362,9 @@ client.Pipeline(ctx, func(p *PipelineContext) error {
 
 ### 1. **Implicit Transaction Semantics**
 
-Pipeline automatically handles transactions:
+Pipeline automatically handles transactions internally using BEGIN/COMMIT:
 ```go
-// ✅ Good - implicit transaction
+// ✅ Good - implicit transaction (BEGIN/COMMIT handled internally)
 client.Pipeline(ctx, func(p *PipelineContext) error {
     p.User.Create(user)
     p.Post.Create(post)
@@ -371,6 +372,7 @@ client.Pipeline(ctx, func(p *PipelineContext) error {
 })
 
 // ❌ Don't wrap in explicit transaction - not needed!
+// Pipeline already uses a connection with BEGIN/COMMIT internally
 tx, _ := client.db.Begin(ctx)
 client.Pipeline(ctx, func(p *PipelineContext) error {
     // Already in a transaction!

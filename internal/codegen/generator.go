@@ -156,7 +156,8 @@ import (
 // {{ .QueryName }} is the query builder for {{ .ModelName }}
 type {{ .QueryName }} struct {
 	client      *Client
-	tx          pgx.Tx  // Optional transaction
+	tx          pgx.Tx     // Optional transaction
+	conn        *pgx.Conn  // Optional connection (for pipeline)
 	predicates  []runtime.Predicate
 	order       []string
 	limitVal    *int
@@ -246,7 +247,7 @@ func (q *{{ $.QueryName }}) Has{{ .MethodName }}With(predicates ...runtime.Predi
 }
 {{ end }}
 
-// getExecutor returns the appropriate query executor (transaction or pool)
+// getExecutor returns the appropriate query executor (transaction, connection, or pool)
 func (q *{{ .QueryName }}) getExecutor() interface {
 	Query(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row
@@ -254,6 +255,9 @@ func (q *{{ .QueryName }}) getExecutor() interface {
 } {
 	if q.tx != nil {
 		return q.tx
+	}
+	if q.conn != nil {
+		return q.conn
 	}
 	return q.client.db
 }
@@ -535,46 +539,52 @@ func (c *Client) Close() {
 // Later queries can use results from earlier queries
 // All operations succeed or all rollback
 func (c *Client) Pipeline(ctx context.Context, fn func(*PipelineContext) error) error {
-	// Begin transaction
-	tx, err := c.db.Begin(ctx)
+	// Acquire connection from pool
+	conn, err := c.db.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return fmt.Errorf("failed to acquire connection: %w", err)
+	}
+	defer conn.Release()
+
+	// Start implicit transaction
+	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
+		return fmt.Errorf("failed to start pipeline: %w", err)
 	}
 
 	// Ensure rollback on panic or error
+	committed := false
 	defer func() {
-		if p := recover(); p != nil {
-			tx.Rollback(ctx)
-			panic(p)
+		if !committed {
+			conn.Exec(ctx, "ROLLBACK")
 		}
 	}()
 
 	// Create pipeline context
 	pctx := &PipelineContext{
-		ctx: ctx,
-		tx:  tx,
-		{{ range .Tables }}{{ toModelName .Name }}: &{{ toModelName .Name }}PipelineClient{tx: tx},
+		ctx:  ctx,
+		conn: conn.Conn(),
+		{{ range .Tables }}{{ toModelName .Name }}: &{{ toModelName .Name }}PipelineClient{conn: conn.Conn()},
 		{{ end }}
 	}
 
 	// Execute user function
 	if err := fn(pctx); err != nil {
-		tx.Rollback(ctx)
 		return err
 	}
 
-	// Commit transaction
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+	// Commit implicit transaction
+	if _, err := conn.Exec(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("failed to commit pipeline: %w", err)
 	}
+	committed = true
 
 	return nil
 }
 
 // PipelineContext provides access to models in a pipelined transaction
 type PipelineContext struct {
-	ctx context.Context
-	tx  pgx.Tx
+	ctx  context.Context
+	conn *pgx.Conn
 	{{ range .Tables }}{{ toModelName .Name }} *{{ toModelName .Name }}PipelineClient
 	{{ end }}
 }
@@ -776,7 +786,7 @@ func (b *{{ toModelName .Name }}Batch) Delete(m *{{ toModelName .Name }}) {
 
 // {{ toModelName .Name }}PipelineClient provides pipeline operations for {{ .Name }}
 type {{ toModelName .Name }}PipelineClient struct {
-	tx pgx.Tx
+	conn *pgx.Conn
 }
 
 // Create inserts a new {{ toModelName .Name }} in the pipeline
@@ -786,9 +796,9 @@ func (c *{{ toModelName .Name }}PipelineClient) Create(m *{{ toModelName .Name }
 		{{ if hasPK . }}RETURNING {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}{{ $pk }}{{ end }}{{ end }}` + "`" + `
 
 	{{ if hasPK . }}
-	err := c.tx.QueryRow(context.Background(), query, {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }}).Scan({{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}&m.{{ toFieldName $pk }}{{ end }})
+	err := c.conn.QueryRow(context.Background(), query, {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }}).Scan({{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}&m.{{ toFieldName $pk }}{{ end }})
 	{{ else }}
-	_, err := c.tx.Exec(context.Background(), query, {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }})
+	_, err := c.conn.Exec(context.Background(), query, {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }})
 	{{ end }}
 	return err
 }
@@ -799,7 +809,7 @@ func (c *{{ toModelName .Name }}PipelineClient) Update(m *{{ toModelName .Name }
 	query := ` + "`" + `UPDATE {{ .Name }} SET {{ range $i, $col := .Columns }}{{ if not $col.IsPrimaryKey }}{{ if $i }}, {{ end }}{{ $col.Name }} = ${{ add $i 1 }}{{ end }}{{ end }}
 		WHERE {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }} AND {{ end }}{{ $pk }} = ${{ add (len $.Columns) (add $i 1) }}{{ end }}` + "`" + `
 
-	_, err := c.tx.Exec(context.Background(), query,
+	_, err := c.conn.Exec(context.Background(), query,
 		{{ range $i, $col := .Columns }}{{ if not $col.IsPrimaryKey }}m.{{ toFieldName $col.Name }}, {{ end }}{{ end }}
 		{{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $pk }}{{ end }})
 	return err
@@ -812,17 +822,17 @@ func (c *{{ toModelName .Name }}PipelineClient) Update(m *{{ toModelName .Name }
 func (c *{{ toModelName .Name }}PipelineClient) Delete(m *{{ toModelName .Name }}) error {
 	{{ if hasPK . }}
 	query := ` + "`" + `DELETE FROM {{ .Name }} WHERE {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }} AND {{ end }}{{ $pk }} = ${{ add $i 1 }}{{ end }}` + "`" + `
-	_, err := c.tx.Exec(context.Background(), query, {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $pk }}{{ end }})
+	_, err := c.conn.Exec(context.Background(), query, {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $pk }}{{ end }})
 	return err
 	{{ else }}
 	return fmt.Errorf("table {{ .Name }} has no primary key, cannot delete")
 	{{ end }}
 }
 
-// Query returns a query builder within the pipeline transaction
+// Query returns a query builder within the pipeline
 func (c *{{ toModelName .Name }}PipelineClient) Query() *{{ toModelName .Name }}Query {
 	return &{{ toModelName .Name }}Query{
-		tx: c.tx,
+		conn: c.conn,
 	}
 }
 {{ end }}
