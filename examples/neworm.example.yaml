@@ -47,6 +47,7 @@ queries:
         type: string
     returns: many    # "one", "many", or "exec"
     model: User
+    batch: false     # Don't enable batch for queries that return data
 
   - name: GetUserWithStats
     description: Get user with post and comment counts
@@ -76,6 +77,33 @@ queries:
       - name: userID
         type: int64
     returns: exec
+    batch: true      # Enable batch - can execute many at once!
+
+  - name: UpdateUserStatus
+    description: Update user status
+    sql: |
+      UPDATE users
+      SET status = $1, updated_at = NOW()
+      WHERE id = $2
+    params:
+      - name: status
+        type: string
+      - name: userID
+        type: int64
+    returns: exec
+    batch: true      # Batch-enabled for mass status updates
+
+  - name: IncrementPostViews
+    description: Increment post view count
+    sql: |
+      UPDATE posts
+      SET views = views + 1, updated_at = NOW()
+      WHERE id = $1
+    params:
+      - name: postID
+        type: int64
+    returns: exec
+    batch: true      # Perfect for batching view increments
 
   - name: GetTopPostsByViews
     description: Get most viewed published posts

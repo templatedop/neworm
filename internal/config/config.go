@@ -42,6 +42,7 @@ type CustomQuery struct {
 	Params      []QueryParam      `yaml:"params"`
 	Returns     string            `yaml:"returns"` // "one", "many", "exec"
 	Model       string            `yaml:"model"`   // Model name to return
+	Batch       bool              `yaml:"batch"`   // Enable batch support for this query
 }
 
 // QueryParam represents a query parameter
