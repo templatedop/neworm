@@ -149,12 +149,14 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/templatedop/neworm/runtime"
 )
 
 // {{ .QueryName }} is the query builder for {{ .ModelName }}
 type {{ .QueryName }} struct {
 	client      *Client
+	tx          pgx.Tx  // Optional transaction
 	predicates  []runtime.Predicate
 	order       []string
 	limitVal    *int
@@ -244,10 +246,22 @@ func (q *{{ $.QueryName }}) Has{{ .MethodName }}With(predicates ...runtime.Predi
 }
 {{ end }}
 
+// getExecutor returns the appropriate query executor (transaction or pool)
+func (q *{{ .QueryName }}) getExecutor() interface {
+	Query(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row
+	Exec(ctx context.Context, sql string, args ...interface{}) (pgx.CommandTag, error)
+} {
+	if q.tx != nil {
+		return q.tx
+	}
+	return q.client.db
+}
+
 // All executes the query and returns all results
 func (q *{{ .QueryName }}) All(ctx context.Context) ([]*{{ .ModelName }}, error) {
 	query := q.buildQuery()
-	rows, err := q.client.db.Query(ctx, query, q.buildArgs()...)
+	rows, err := q.getExecutor().Query(ctx, query, q.buildArgs()...)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +301,7 @@ func (q *{{ .QueryName }}) First(ctx context.Context) (*{{ .ModelName }}, error)
 func (q *{{ .QueryName }}) Count(ctx context.Context) (int64, error) {
 	query := q.buildCountQuery()
 	var count int64
-	err := q.client.db.QueryRow(ctx, query, q.buildArgs()...).Scan(&count)
+	err := q.getExecutor().QueryRow(ctx, query, q.buildArgs()...).Scan(&count)
 	return count, err
 }
 
@@ -295,7 +309,7 @@ func (q *{{ .QueryName }}) Count(ctx context.Context) (int64, error) {
 func (q *{{ .QueryName }}) Sum(ctx context.Context, field string) (float64, error) {
 	query := q.buildAggregateQuery("SUM", field)
 	var result *float64
-	err := q.client.db.QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
+	err := q.getExecutor().QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
 	if err != nil {
 		return 0, err
 	}
@@ -309,7 +323,7 @@ func (q *{{ .QueryName }}) Sum(ctx context.Context, field string) (float64, erro
 func (q *{{ .QueryName }}) Avg(ctx context.Context, field string) (float64, error) {
 	query := q.buildAggregateQuery("AVG", field)
 	var result *float64
-	err := q.client.db.QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
+	err := q.getExecutor().QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
 	if err != nil {
 		return 0, err
 	}
@@ -323,7 +337,7 @@ func (q *{{ .QueryName }}) Avg(ctx context.Context, field string) (float64, erro
 func (q *{{ .QueryName }}) Min(ctx context.Context, field string) (interface{}, error) {
 	query := q.buildAggregateQuery("MIN", field)
 	var result interface{}
-	err := q.client.db.QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
+	err := q.getExecutor().QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
 	return result, err
 }
 
@@ -331,7 +345,7 @@ func (q *{{ .QueryName }}) Min(ctx context.Context, field string) (interface{}, 
 func (q *{{ .QueryName }}) Max(ctx context.Context, field string) (interface{}, error) {
 	query := q.buildAggregateQuery("MAX", field)
 	var result interface{}
-	err := q.client.db.QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
+	err := q.getExecutor().QueryRow(ctx, query, q.buildArgs()...).Scan(&result)
 	return result, err
 }
 
@@ -358,7 +372,7 @@ func (q *{{ .QueryName }}) UpdateAll(ctx context.Context, updates map[string]int
 		args = append(args, q.buildArgs()...)
 	}
 
-	result, err := q.client.db.Exec(ctx, query, args...)
+	result, err := q.getExecutor().Exec(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -373,7 +387,7 @@ func (q *{{ .QueryName }}) DeleteAll(ctx context.Context) (int64, error) {
 		query += " WHERE " + q.buildWhere()
 	}
 
-	result, err := q.client.db.Exec(ctx, query, q.buildArgs()...)
+	result, err := q.getExecutor().Exec(ctx, query, q.buildArgs()...)
 	if err != nil {
 		return 0, err
 	}
@@ -515,6 +529,54 @@ func NewClient(db *pgxpool.Pool) *Client {
 // Close closes the database connection
 func (c *Client) Close() {
 	c.db.Close()
+}
+
+// Pipeline executes operations sequentially with implicit transaction semantics
+// Later queries can use results from earlier queries
+// All operations succeed or all rollback
+func (c *Client) Pipeline(ctx context.Context, fn func(*PipelineContext) error) error {
+	// Begin transaction
+	tx, err := c.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	// Ensure rollback on panic or error
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback(ctx)
+			panic(p)
+		}
+	}()
+
+	// Create pipeline context
+	pctx := &PipelineContext{
+		ctx: ctx,
+		tx:  tx,
+		{{ range .Tables }}{{ toModelName .Name }}: &{{ toModelName .Name }}PipelineClient{tx: tx},
+		{{ end }}
+	}
+
+	// Execute user function
+	if err := fn(pctx); err != nil {
+		tx.Rollback(ctx)
+		return err
+	}
+
+	// Commit transaction
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// PipelineContext provides access to models in a pipelined transaction
+type PipelineContext struct {
+	ctx context.Context
+	tx  pgx.Tx
+	{{ range .Tables }}{{ toModelName .Name }} *{{ toModelName .Name }}PipelineClient
+	{{ end }}
 }
 
 // NewBatch creates a new batch operation
@@ -710,6 +772,58 @@ func (b *{{ toModelName .Name }}Batch) Update(m *{{ toModelName .Name }}) {
 // Delete adds a delete operation to the batch
 func (b *{{ toModelName .Name }}Batch) Delete(m *{{ toModelName .Name }}) {
 	b.deletes = append(b.deletes, m)
+}
+
+// {{ toModelName .Name }}PipelineClient provides pipeline operations for {{ .Name }}
+type {{ toModelName .Name }}PipelineClient struct {
+	tx pgx.Tx
+}
+
+// Create inserts a new {{ toModelName .Name }} in the pipeline
+func (c *{{ toModelName .Name }}PipelineClient) Create(m *{{ toModelName .Name }}) error {
+	query := ` + "`" + `INSERT INTO {{ .Name }} ({{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}{{ $col.Name }}{{ end }})
+		VALUES ({{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}${{ add $i 1 }}{{ end }})
+		{{ if hasPK . }}RETURNING {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}{{ $pk }}{{ end }}{{ end }}` + "`" + `
+
+	{{ if hasPK . }}
+	err := c.tx.QueryRow(context.Background(), query, {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }}).Scan({{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}&m.{{ toFieldName $pk }}{{ end }})
+	{{ else }}
+	_, err := c.tx.Exec(context.Background(), query, {{ range $i, $col := .Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $col.Name }}{{ end }})
+	{{ end }}
+	return err
+}
+
+// Update updates a {{ toModelName .Name }} in the pipeline
+func (c *{{ toModelName .Name }}PipelineClient) Update(m *{{ toModelName .Name }}) error {
+	{{ if hasPK . }}
+	query := ` + "`" + `UPDATE {{ .Name }} SET {{ range $i, $col := .Columns }}{{ if not $col.IsPrimaryKey }}{{ if $i }}, {{ end }}{{ $col.Name }} = ${{ add $i 1 }}{{ end }}{{ end }}
+		WHERE {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }} AND {{ end }}{{ $pk }} = ${{ add (len $.Columns) (add $i 1) }}{{ end }}` + "`" + `
+
+	_, err := c.tx.Exec(context.Background(), query,
+		{{ range $i, $col := .Columns }}{{ if not $col.IsPrimaryKey }}m.{{ toFieldName $col.Name }}, {{ end }}{{ end }}
+		{{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $pk }}{{ end }})
+	return err
+	{{ else }}
+	return fmt.Errorf("table {{ .Name }} has no primary key, cannot update")
+	{{ end }}
+}
+
+// Delete deletes a {{ toModelName .Name }} in the pipeline
+func (c *{{ toModelName .Name }}PipelineClient) Delete(m *{{ toModelName .Name }}) error {
+	{{ if hasPK . }}
+	query := ` + "`" + `DELETE FROM {{ .Name }} WHERE {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }} AND {{ end }}{{ $pk }} = ${{ add $i 1 }}{{ end }}` + "`" + `
+	_, err := c.tx.Exec(context.Background(), query, {{ range $i, $pk := .PrimaryKey.Columns }}{{ if $i }}, {{ end }}m.{{ toFieldName $pk }}{{ end }})
+	return err
+	{{ else }}
+	return fmt.Errorf("table {{ .Name }} has no primary key, cannot delete")
+	{{ end }}
+}
+
+// Query returns a query builder within the pipeline transaction
+func (c *{{ toModelName .Name }}PipelineClient) Query() *{{ toModelName .Name }}Query {
+	return &{{ toModelName .Name }}Query{
+		tx: c.tx,
+	}
 }
 {{ end }}
 `
