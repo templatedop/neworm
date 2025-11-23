@@ -1,0 +1,107 @@
+# neworm configuration example
+# Copy this to neworm.yaml and customize for your database
+
+connection:
+  host: localhost
+  port: 5432
+  database: mydb
+  user: postgres
+  password: password
+  schema: public
+  ssl_mode: prefer
+
+generation:
+  output_dir: ./db
+  package_name: db
+  # Specify tables to generate (empty = all tables)
+  tables: []
+  # Exclude specific tables
+  exclude_tables:
+    - migrations
+    - schema_migrations
+
+relationships:
+  # Auto-detect relationships from foreign key constraints
+  auto_detect: true
+
+  # Custom relationship overrides (optional)
+  custom:
+    # Example: Customize the posts -> users relationship
+    - from: posts
+      to: users
+      strategy: join      # "join" or "batch"
+      name: Author       # Custom method name (default: User)
+      type: many-to-one  # one-to-one, one-to-many, many-to-one
+
+queries:
+  # Custom SQL queries to generate as type-safe methods
+
+  - name: GetActiveUsersByCity
+    description: Get all active users in a specific city
+    sql: |
+      SELECT * FROM users
+      WHERE active = true AND city = $1
+      ORDER BY created_at DESC
+    params:
+      - name: city
+        type: string
+    returns: many    # "one", "many", or "exec"
+    model: User
+
+  - name: GetUserWithStats
+    description: Get user with post and comment counts
+    sql: |
+      SELECT
+        u.*,
+        COUNT(DISTINCT p.id) as post_count,
+        COUNT(DISTINCT c.id) as comment_count
+      FROM users u
+      LEFT JOIN posts p ON u.id = p.user_id
+      LEFT JOIN comments c ON u.id = c.user_id
+      WHERE u.id = $1
+      GROUP BY u.id
+    params:
+      - name: userID
+        type: int64
+    returns: one
+    model: User
+
+  - name: UpdateUserLastLogin
+    description: Update user's last login timestamp
+    sql: |
+      UPDATE users
+      SET last_login_at = NOW()
+      WHERE id = $1
+    params:
+      - name: userID
+        type: int64
+    returns: exec
+
+  - name: GetTopPostsByViews
+    description: Get most viewed published posts
+    sql: |
+      SELECT p.*, u.name as author_name, u.email as author_email
+      FROM posts p
+      JOIN users u ON p.user_id = u.id
+      WHERE p.published = true
+      ORDER BY p.views DESC
+      LIMIT $1
+    params:
+      - name: limit
+        type: int32
+    returns: many
+    model: Post
+
+  - name: SearchPostsByTag
+    description: Search posts by tag
+    sql: |
+      SELECT p.*
+      FROM posts p
+      WHERE p.tags @> ARRAY[$1]::text[]
+        AND p.published = true
+      ORDER BY p.created_at DESC
+    params:
+      - name: tag
+        type: string
+    returns: many
+    model: Post
